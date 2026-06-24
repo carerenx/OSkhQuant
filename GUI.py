@@ -41,6 +41,7 @@ class NoWheelDateEdit(QDateEdit):
         self.setup_font()
         
     def setup_font(self):
+        
         """设置字体，解决中文显示问题"""
         try:
             from PyQt5.QtGui import QFont, QFontDatabase

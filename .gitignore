@@ -1,5 +1,7 @@
 # KhQuant 看海量化交易系统 - Git忽略文件
 
+
+/stock_data
 # ===== Python 相关 =====
 # 字节码文件
 __pycache__/

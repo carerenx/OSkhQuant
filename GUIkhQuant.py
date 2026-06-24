@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import logging
 import psutil
 import time
@@ -182,10 +183,16 @@ class StrategyThread(QThread):
         return self._is_running
 
 class GUILogHandler(logging.Handler):
-    """自定义日志处理器，将日志信息显示在GUI的运行日志表格中"""
+    """自定义日志处理器，将日志信息显示在GUI的运行日志表格中
+
+    注意: 使用简化的格式器仅输出原始消息，时间戳与事件类别由
+    KhQuantGUI._log_message() 统一添加，避免格式重复。
+    """
     def __init__(self, gui):
         super().__init__()
         self.gui = gui
+        # GUI 日志处理器使用纯消息格式 — 时间戳和级别由 _log_message 统一管理
+        self.setFormatter(logging.Formatter('%(message)s'))
 
     def emit(self, record):
         try:
@@ -907,8 +914,8 @@ class KhQuantGUI(QMainWindow):
         self.setStyleSheet(self.get_scaled_stylesheet())
         
         # 创建自定义日志处理器（移到最前面）
+        # GUILogHandler 内部已配置为纯消息格式 — 时间戳/类别由 _log_message 统一管理
         self.log_handler = GUILogHandler(self)
-        self.log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
         logging.getLogger('').addHandler(self.log_handler)
         
         # 设置窗口标题
@@ -3168,12 +3175,76 @@ class KhQuantGUI(QMainWindow):
         }
         self.update_trade_log(trade_info)
 
+    # ── 事件类别自动检测 ──────────────────────────────────────────
+    # 按优先级排列，先匹配到的优先（错误/警告 > 信号 > 交易 > 持仓 > ...）
+    EVENT_CATEGORIES = [
+        # (类别, 显示标签, [关键词正则列表])
+        ("error",    "✗ 错误", [r"错误", r"失败", r"异常", r"报错", r"Error", r"Exception",
+                                r"出错", r"超时"]),
+        ("warning",  "⚠ 警告", [r"警告", r"跳过", r"忽略", r"过期"]),
+        ("signal",   "信号",   [r">>>\s*\[买入\]", r">>>\s*\[卖出\]",
+                                r"生成.*信号", r"\[信号\]",
+                                r"止损触发", r"Alpha144突破",
+                                r"计算买入量", r"\[买入\]", r"\[卖出\]"]),
+        ("trade",    "交易",   [r"交易信息", r"交易成本", r"委托信息", r"成交信息",
+                                r"委托编号", r"成交编号", r"TRADE",
+                                r"买入", r"卖出", r"开多", r"平多", r"开空", r"平空"]),
+        ("position", "持仓",   [r"持仓变动", r"持仓=\d+只", r"持有天数",
+                                r"\[摘要\]", r"bar=\d+",
+                                r"持仓数量", r"持仓市值", r"持仓盈亏"]),
+        ("factor",   "因子",   [r"\[因子\]", r"Alpha144.*排名", r"因子排名",
+                                r"Top\d+%", r"候选池"]),
+        ("daily",    "日统计", [r"每日统计", r"日收益率", r"总资产:"]),
+        ("backtest", "回测",   [r"回测", r"基准指数", r"benchmark",
+                                r"最大回撤", r"夏普", r"执行时间统计"]),
+        ("data",     "数据",   [r"加载.*数据", r"下载", r"获取.*数据", r"股票列表",
+                                r"历史数据", r"数据初始化", r"数据补充", r"K线",
+                                r"数据周期", r"数据形状", r"数据字段", r"dict_keys"]),
+        ("strategy", "策略",   [r"策略.*启动", r"策略.*运行", r"策略.*完成",
+                                r"策略.*初始化", r"策略文件", r"策略名称",
+                                r"策略主逻辑", r"解析的策略", r"启动策略"]),
+        ("file",     "文件",   [r"路径", r"目录", r"文件.*保存", r"创建.*目录",
+                                r"已创建", r"已保存", r"配置文件", r"安全目录名"]),
+        ("progress", "进度",   [r"进度", r"\d+%", r"百分比"]),
+        ("system",   "系统",   [r"日志已清空", r"软件准备", r"配置信息",
+                                r"交易模式", r"股票池类型", r"交易接口",
+                                r"预处理阶段", r"交易回调", r"交易模式",
+                                r"价格精度", r"开始初始化"]),
+    ]
+
+    @classmethod
+    def _detect_event_category(cls, message):
+        """从日志消息内容自动检测事件类别"""
+        if not message:
+            return ("信息", "INFO")
+        for category, label, patterns in cls.EVENT_CATEGORIES:
+            for pattern in patterns:
+                if re.search(pattern, message):
+                    return (label, category.upper())
+        return ("信息", "INFO")
+
+    @staticmethod
+    def _clean_log_message(message):
+        """清理日志消息中的冗余时间戳前缀
+
+        Python logging 模块产生的消息格式为:
+            "2026-06-21 02:33:30,402 - INFO - 实际消息"
+        该方法去掉这个前缀，保留纯消息内容。
+        """
+        if not message:
+            return message
+        # 匹配并移除: "YYYY-MM-DD HH:MM:SS,mmm - LEVEL - "
+        cleaned = re.sub(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} - \w+ - ', '', message)
+        return cleaned
+
     @pyqtSlot(str, str)
     def _log_message(self, message, level="INFO"):
         """实际的日志处理函数（在GUI线程中执行）"""
         try:
-            # 获取当前时间
-            current_time = datetime.now().strftime("%H:%M:%S")
+            # 获取完整时间戳（精确到秒）
+            now = datetime.now()
+            current_time = now.strftime("%H:%M:%S")           # UI 显示用（紧凑）
+            full_time = now.strftime("%Y-%m-%d %H:%M:%S")     # 保存用（完整）
             
             # 检查是否是进度消息（仅更新进度条，不显示在日志中）
             # 仅当策略实际运行时才处理进度条相关的日志消息
@@ -3196,33 +3267,37 @@ class KhQuantGUI(QMainWindow):
                 except (IndexError, ValueError):
                     pass
             
+            # 清理 Python logging 模块产生的冗余时间戳前缀
+            clean_message = self._clean_log_message(message)
+
+            # 自动检测事件类别
+            category_label, category = self._detect_event_category(clean_message)
+
             # 根据日志级别设置颜色
             color_map = {
-                "DEBUG": "#BB8FCE",    # 浅紫色
-                "INFO": "#e8e8e8",     # 白色
-                "WARNING": "#FFA500",  # 橙色
-                "ERROR": "#FF0000",    # 红色
-                "TRADE": "#007acc"     # 蓝色（用于交易信息）
+                "DEBUG":  "#BB8FCE",   # 浅紫色
+                "INFO":   "#e8e8e8",   # 白色
+                "WARNING":"#FFA500",   # 橙色
+                "ERROR":  "#FF0000",   # 红色
+                "TRADE":  "#007acc",   # 蓝色（交易信息）
             }
-            
-            # 获取颜色
             color = color_map.get(level, "#e8e8e8")
-            
-            # 格式化日志消息
-            formatted_message = f'<span style="color: {color}">[{current_time}] [{level}] {message}</span><br>'
-            
-            # 在终端输出纯文本格式的日志
-            print(f"[{current_time}] [{level}] {message}")
-            
+
+            # 格式化日志消息（UI 紧凑显示: [HH:MM:SS] [事件类别] 消息）
+            formatted_message = f'<span style="color: {color}">[{current_time}] [{category_label}] {clean_message}</span><br>'
+
+            # 终端输出（纯文本格式）
+            print(f"[{full_time}] [{category_label}] {clean_message}")
+
             # 过滤不需要在界面显示的系统和更新相关的日志
             should_skip_gui_log = False
             system_log_keywords = [
-                "主窗口创建成功", 
-                "加载进度", 
-                "初始化系统", 
-                "检查更新", 
-                "加载组件", 
-                "准备用户界面", 
+                "主窗口创建成功",
+                "加载进度",
+                "初始化系统",
+                "检查更新",
+                "加载组件",
+                "准备用户界面",
                 "启动完成",
                 "启动画面",
                 "软件更新",
@@ -3250,32 +3325,35 @@ class KhQuantGUI(QMainWindow):
                 "High Tower Text",
                 ".ttf"
             ]
-            
+
             # 特例：允许"软件准备就绪"消息显示在GUI上
-            if message == "软件准备就绪":
+            if clean_message == "软件准备就绪":
                 should_skip_gui_log = False
             else:
                 for keyword in system_log_keywords:
-                    if keyword in message:
+                    if keyword in clean_message:
                         should_skip_gui_log = True
                         break
-            
+
             # 如果是需要跳过的日志，只存储但不显示在GUI上
             if not should_skip_gui_log:
-                # 存储日志条目
+                # 存储结构化日志条目
                 log_entry = {
-                    'time': current_time,
-                    'level': level,
-                    'message': message,
-                    'formatted': formatted_message
+                    'time':           current_time,
+                    'full_time':      full_time,
+                    'level':          level,
+                    'category':       category,
+                    'category_label': category_label,
+                    'message':        clean_message,
+                    'formatted':      formatted_message,
                 }
                 self.log_entries.append(log_entry)
-                
+
                 # 如果启用了延迟显示模式且策略正在运行，则添加到延迟日志队列
                 if hasattr(self, 'delay_log_display') and self.delay_log_display and hasattr(self, 'strategy_is_running') and self.strategy_is_running:
                     self.delayed_logs.append(log_entry)
                     return  # 不立即显示
-                
+
                 # 检查是否应该显示这条日志（根据过滤器设置）
                 if hasattr(self, 'log_filters') and level in self.log_filters and self.log_filters[level].isChecked():
                     # 添加到文本框
@@ -3292,11 +3370,16 @@ class KhQuantGUI(QMainWindow):
             else:
                 # 即使是被跳过的系统日志，如果启用了延迟显示模式且策略正在运行，也要保存
                 if hasattr(self, 'delay_log_display') and self.delay_log_display and hasattr(self, 'strategy_is_running') and self.strategy_is_running:
+                    clean_message = self._clean_log_message(message)
+                    category_label, category = self._detect_event_category(clean_message)
                     log_entry = {
-                        'time': current_time,
-                        'level': level,
-                        'message': message,
-                        'formatted': formatted_message
+                        'time':           current_time,
+                        'full_time':      full_time,
+                        'level':          level,
+                        'category':       category,
+                        'category_label': category_label,
+                        'message':        clean_message,
+                        'formatted':      formatted_message,
                     }
                     self.delayed_logs.append(log_entry)
                 
@@ -3358,26 +3441,71 @@ class KhQuantGUI(QMainWindow):
         self.log_message("日志已清空", "INFO")
 
     def save_log(self):
-        """保存日志到文件"""
+        """保存日志到文件（结构化输出，带事件类别）
+
+        输出格式:
+            [2026-06-21 02:33:30] [策略] 开始启动策略...
+            [2026-06-21 02:33:30] [数据] 加载600028.SH的历史数据...
+            [2026-06-21 02:33:30] [✗ 错误] 连接失败: timeout
+        """
         try:
-            # 选择保存路径
+            # 默认文件名：日期时间（精确到秒）
+            default_name = f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            default_path = os.path.join(os.path.dirname(__file__), "logs", default_name)
+
             file_name, _ = QFileDialog.getSaveFileName(
                 self,
                 "保存日志",
-                os.path.join(os.path.dirname(__file__), "logs", f"log_{int(time.time())}.txt"),
+                default_path,
                 "Text Files (*.txt);;All Files (*)"
             )
-            
+
             if file_name:
-                # 获取纯文本内容
-                log_content = self.log_text.toPlainText()
-                
-                # 保存到文件
+                # 收集所有日志条目: log_entries + delayed_logs（去重）
+                seen = set()
+                all_entries = []
+                for entry in self.log_entries + getattr(self, 'delayed_logs', []):
+                    dedup_key = (entry.get('full_time', ''),
+                                 entry.get('category_label', ''),
+                                 entry.get('message', ''))
+                    if dedup_key not in seen:
+                        seen.add(dedup_key)
+                        all_entries.append(entry)
+
+                now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
                 with open(file_name, 'w', encoding='utf-8') as f:
-                    f.write(log_content)
-                
+                    # ── 文件头 ──
+                    f.write('═' * 70 + '\n')
+                    f.write(f'  KHQuant 运行日志\n')
+                    f.write(f'  保存时间: {now_str}\n')
+                    f.write(f'  日志条数: {len(all_entries)}\n')
+
+                    # 统计类别分布
+                    cat_counts: dict[str, int] = {}
+                    for entry in all_entries:
+                        cat = entry.get('category_label', '信息')
+                        cat_counts[cat] = cat_counts.get(cat, 0) + 1
+                    if cat_counts:
+                        stats = '  '.join(f'{k}:{v}' for k, v in cat_counts.items())
+                        f.write(f'  类别统计: {stats}\n')
+
+                    f.write('═' * 70 + '\n\n')
+
+                    # ── 日志正文 ──
+                    for entry in all_entries:
+                        ft  = entry.get('full_time', '')
+                        cat = entry.get('category_label', '信息')
+                        msg = entry.get('message', '')
+                        f.write(f'[{ft}] [{cat}] {msg}\n')
+
+                    # ── 文件尾 ──
+                    f.write(f'\n{"─" * 70}\n')
+                    f.write(f'  日志结束  —  {now_str}\n')
+                    f.write(f'{"═" * 70}\n')
+
                 self.log_message(f"日志已保存到: {file_name}", "INFO")
-                
+
         except Exception as e:
             self.log_message(f"保存日志失败: {str(e)}", "ERROR")
 
